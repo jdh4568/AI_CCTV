@@ -447,7 +447,7 @@ class ResourceMonitorWindow(QDialog):
     def refresh_smart_resources(self):
         if not self.resource_server_url:
             self.summary_label.setText("스마트CCTV 리소스 서버 주소가 설정되지 않았습니다.")
-            self.smart_status_label.setText("RTSP 주소를 설정하면 같은 IP의 8002 포트로 연결합니다.")
+            self.smart_status_label.setText("카메라 관리에서 장치 API 기본 주소를 등록하세요. 로컬 PC 정보는 계속 표시합니다.")
             self.show_smart_network_warning(
                 "스마트CCTV 주소를 찾을 수 없습니다.",
                 "설정에서 RTSP 주소가 rtsp://라즈베리파이IP:포트/경로 형태인지 확인하세요.",
@@ -533,7 +533,11 @@ class ResourceMonitorWindow(QDialog):
         )
 
     def handle_smart_resource_finished(self):
+        if self.remote_worker is not None:
+            self.remote_worker.deleteLater()
         self.remote_worker = None
+        if getattr(self, "_closing", False):
+            self.done(self._close_result)
 
     def show_smart_resource_cards(self):
         self.smart_content_stack.setCurrentIndex(0)
@@ -757,10 +761,22 @@ class ResourceMonitorWindow(QDialog):
             "detail": f"최고 온도 센서: {max_name}",
         }
 
-    def closeEvent(self, event):
+    def done(self, result):
         self.timer.stop()
         if self.remote_worker is not None and self.remote_worker.isRunning():
-            self.remote_worker.quit()
-            self.remote_worker.wait(4000)
+            self._closing = True
+            self._close_result = result
+            self.setEnabled(False)
+            return
         self.cpu_utility_counter.close()
-        event.accept()
+        super().done(result)
+
+    def reject(self):
+        self.done(QDialog.Rejected)
+
+    def closeEvent(self, event):
+        self.done(QDialog.Rejected)
+        if self.remote_worker is not None and self.remote_worker.isRunning():
+            event.ignore()
+        else:
+            event.accept()

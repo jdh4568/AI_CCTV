@@ -691,6 +691,158 @@ PyQt 시작 시 회원가입 창과 로그인 창 중 어느 화면을 표시할
 
 ---
 
+## 모바일 인물 이벤트 상세 API — 1단계
+
+1단계에서 `GET /api/v1/mobile/events/{event_id}`, 2단계에서 `GET /api/v1/mobile/events/{event_id}/trajectory`, 3단계에서 `GET /api/v1/mobile/events/{event_id}/clip`을 추가했다. 모바일 상세 작업/연동 전 이 절을 읽는다. 기존 이벤트 상세·모바일 목록·crop API와 DB 구조는 유지한다.
+
+### 요청과 응답
+
+- 기존 관리자 Access 토큰을 `Authorization: Bearer <access_token>`으로 전달한다. ID는 1~2^63−1 정수다. 로그인/세션 정책은 기존과 같다.
+- 인물 등장/사라짐만 지원한다. 성공 200 + Cache-Control: no-store. 발생 시각은 UTC 고정 소수 6자리 Z이며 카메라 이름은 현재 등록 이름이다.
+
+```json
+{
+  "event_id": 38,
+  "event_type": "person_disappeared",
+  "occurred_at": "2026-11-20T17:50:52.710282Z",
+  "global_person_id": 2,
+  "camera_id": 3,
+  "camera_name": "라즈베리파이",
+  "cnn_result": null,
+  "crop_url": "/api/v1/mobile/events/38/crop",
+  "trajectory_url": "/api/v1/mobile/events/38/trajectory",
+  "clip_url": "/api/v1/mobile/events/38/clip"
+}
+```
+
+- 등장은 자기 미디어 경로/cnn_result, 사라짐은 related_event_id로 연결된 등장 데이터를 사용한다. ID/종류/발생 시각/글로벌 ID/카메라는 선택한 이벤트 자체의 값이다.
+- cnn_result는 기존 CNNResult 전체(model_version/attributes)를 반환한다. 성별·나이 외 모자·상하의 색상·소매·하의 종류·소지품도 포함하며 분석 결과가 없으면 null이다. 기존 CNN API 계약을 따른다.
+- 미디어별 DB 경로가 없으면 해당 URL만 null이다. 결과/경로가 저장된 뒤 재조회하면 최신 정보가 반영된다. 분석 대기와 실패는 따로 구분하지 않는다.
+- URL은 서버 기준 상대 주소이며 저장소 절대경로/장치 주소는 노출하지 않는다. 파일 존재 확인/다운로드는 JSON 조회에서 하지 않으므로 저장소가 잠시 없어도 상세 정보는 조회 가능하다.
+- crop_url/trajectory_url은 인증된 이미지 API, clip_url은 아래 3단계 인증된 영상 API로 요청할 수 있다. 상세 응답에 이미지/영상 바이트나 Base64를 넣지 않는다.
+
+| 상태 | 오류 코드 | 조건 |
+| --- | --- | --- |
+| 401 | INVALID_ACCESS_TOKEN | 인증 누락/만료/Refresh 오용/로그아웃 세션 |
+| 404 | EVENT_NOT_FOUND | 이벤트 없음 |
+| 409 | EVENT_DETAIL_NOT_SUPPORTED | 카메라 시작/중지 이벤트 |
+| 422 | VALIDATION_ERROR | ID 형식/범위 오류 |
+
+### 1단계 확인
+
+같은 PC의 Postman에서 기존 로그인 후 Bearer Token을 설정하고 `http://127.0.0.1:9000/api/v1/mobile/events/인물이벤트ID`에 GET한다. 같은 Wi-Fi의 앱에서는 base URL을 실제 PC 내부 IP로 바꾼다. 등장과 사라짐을 각각 요청하여 자체 시각/타입 유지, 같은 관측의 CNN/미디어 결합을 확인한다. 1단계는 상세 JSON만 검증했으며 현재는 아래 2단계 궤적과 3단계 클립도 확인할 수 있다.
+
+임시 DB의 자동 테스트는 `backend/tests/test_mobile_event_detail_api.py`이며 등장/사라짐, CNN 전체/미디어 재조회, null, 카메라/없는 이벤트/인증 오류, 기존 DTO 보존 및 실제 로컬 Uvicorn HTTP를 확인한다. 운영 DB·카메라·Postman 직접 실행·Flutter 확인과 구분한다. 구현/검증 현황은 [백엔드 README](../backend/README.md)의 모바일 상세 1단계를 따른다.
+
+### 2단계 궤적 이미지 — GET /api/v1/mobile/events/{event_id}/trajectory
+
+- 기존 관리자 Access Bearer 인증과 양의 64비트 이벤트 ID를 사용한다. 목록/상세/crop 계약은 유지한다.
+- 등장은 자기 trajectory_path, 사라짐은 연결된 등장의 trajectory_path를 조회한다. 성공 200 + 원본 image/jpeg, Cache-Control: no-store, X-Content-Type-Options: nosniff다.
+- 이벤트 없음은 404 EVENT_NOT_FOUND. 경로 미등록/카메라 이벤트/파일·저장소 없음/빈 파일/디렉터리/읽기 실패/잘못된 경로는 404 EVENT_TRAJECTORY_NOT_FOUND다. 인증 실패는 401, ID 형식/범위 오류는 422다. 내부 경로는 오류 응답에 넣지 않는다.
+- 기존 StorageService 검증과 crop 이미지 읽기 흐름을 공유한다. 요청한 이미지 필드만 검증하므로 crop/clip이 없어도 궤적만 있으면 제공한다. 저장소 경계·이벤트 인물/카메라/날짜·trajectory.jpg 이름·링크/junction을 검사한다.
+- 파일을 검증한 뒤 바로 읽어 반환한다. 이미지 변환/디코딩은 하지 않으며 파일 생성/완료는 PC 책임이다. 검증 직후 외부 프로세스의 파일·링크 교체까지 원자적으로 막지는 않는다.
+- 폴더 변경 뒤 DB 경로 PATCH가 반영되면 같은 URL로 최신 파일을 반환한다. 상세 JSON은 파일 유무를 검사하지 않으므로 URL이 있어도 파일 GET은 404일 수 있다.
+- Postman에서 상세의 trajectory_url이 null이 아니면 base URL에 붙이고 동일한 Bearer Token으로 GET한다. Body Preview에서 이미지를 확인한다. 사라짐 카드 ID로도 같은 관측의 이미지를 받는지 확인한다.
+- 자동 검증은 `backend/tests/test_mobile_event_detail_api.py`에 있으며 임시 DB/JPEG와 로컬 임시 Uvicorn HTTP만 사용한다. 운영 DB·카메라·Postman 직접 실행·Flutter의 이미지 표시를 검증한 것은 아니다.
+
+### 3단계 클립 영상 — GET /api/v1/mobile/events/{event_id}/clip
+
+- 기존 관리자 Access Bearer 인증과 양의 64비트 이벤트 ID를 사용한다. 등장은 자기 clip_path, 사라짐은 연결된 등장의 clip_path를 읽는다. crop/궤적의 등록/존재 여부와 독립적이다.
+- Range 헤더가 없으면 200 video/mp4 전체 파일이다. Accept-Ranges: bytes, Content-Length, Cache-Control: no-store, X-Content-Type-Options: nosniff를 반환한다.
+- 단일 `Range: bytes=start-end`, `bytes=start-`, `bytes=-suffix`를 지원한다. 성공 206 video/mp4, Content-Range: bytes start-end/전체크기, Content-Length: 반환바이트수다. 끝이 파일 크기를 넘으면 마지막 바이트로 제한하며 suffix가 전체 크기보다 크면 전체 범위를 206으로 반환한다. 숫자는 ASCII 0~9 최대 20자리다.
+- 역순/시작점이 EOF 이상/0 suffix/잘못된 문법/지원하지 않는 단위/다중 범위(콤마 또는 중복 Range 헤더)는 416 INVALID_CLIP_RANGE JSON이다. Content-Range: bytes */전체크기와 Accept-Ranges: bytes를 포함한다.
+- ETag/Last-Modified 검증자는 제공하지 않는다. If-Range 헤더가 있으면 부분 응답 대신 전체 200을 반환한다. HEAD/다중 범위/영상 변환은 이번 MVP에 추가하지 않는다.
+- 이벤트 없음은 404 EVENT_NOT_FOUND. 경로 미등록/카메라 이벤트/파일·저장소 없음/빈 파일/디렉터리/경로 검증·파일 열기·seek 실패는 404 EVENT_CLIP_NOT_FOUND다. 인증 실패는 401, 잘못된 ID는 422다. 인증·이벤트·파일 검증이 Range 검사보다 먼저다.
+- 기존 저장소 경계/상대 경로/인물·카메라·날짜/clip.mp4/링크·junction 검증을 적용하고 일반 파일을 연 뒤 크기를 확인한다. 내부 파일 경로는 응답하지 않는다.
+- 파일을 최대 64 KiB 청크로 읽고 지정 범위만 전송한다. DB 세션·저장소 잠금은 전송 전에 해제하며 완료/클라이언트 중단/전송 실패 시 파일을 닫는다. 파일 내용의 MP4 적합성/코덱은 기존 PC 저장 책임이다. 검증 직후 외부 파일·링크 교체까지 원자적으로 보호하지 않으며, 응답 시작 후 파일이 잘리거나 읽기가 실패하면 전송이 중단될 수 있다. 이후 404 JSON으로 바꾸지는 못한다.
+- Postman: clip_url이 있으면 같은 Bearer Token으로 GET한다. 200 전체 응답을 파일로 저장해 재생 확인할 수 있다. `Range: bytes=0-1023`를 추가하면 206/Content-Range/Content-Length를 확인한다(작은 파일은 끝을 제한). `Range: bytes=0-1,4-5`는 416이다. 운영 파일을 삭제/편집할 필요는 없다.
+- 자동 검증은 `backend/tests/test_mobile_clip_api.py`에서 임시 DB/파일로 수행한다. 실제 로컬 HTTP에서 합성 MP4 전체·부분 수신과 내려받은 파일 디코딩을 확인한다. 실제 카메라·운영 미디어·Postman 직접 실행·Flutter/휴대폰 플레이어 재생 검증과 구분한다. 컬렉션 확장은 상세 4단계다.
+
+### 4단계 검증 자료와 사용자 인계
+
+확장된 [Postman 컬렉션](../backend/postman/mobile-events.postman_collection.json)은 기존 01~07을 유지하고 08 상세 JSON, 09 궤적, 10 클립 전체, 11 부분 Range, 12 suffix Range, 13 다중 Range 오류, 14 카메라 상세 제한을 추가했다. 모두 기존 Access 인증을 사용하며 카메라 오류 요청은 camera_event_id, 나머지 상세/미디어는 인물 event_id를 사용한다. 미디어가 null/파일 없음이면 해당 수신/Range 항목은 미확인으로 남긴다. 실제 값이 없는 변수는 직접 입력한다.
+
+변수 설정/확인 순서/검증 결과/남은 범위는 [백엔드 README의 상세 4단계](../backend/README.md#모바일-인물-이벤트-상세-4단계-회귀-확인postman-인계)를 따른다. 제품 코드가 유지되어 직전 137개 회귀 결과를 재사용했으며, 확장 컬렉션 구성으로 임시 서버에 20개 HTTP 요청을 보내 확인했다. Postman UI 직접 실행·실제 카메라 미디어·Flutter 재생을 완료한 것은 아니다. 다음은 사용자 Postman 확인이다.
+
+## 모바일 이벤트 목록 API — 2026-11-21 1~2단계
+
+기존 이벤트/인증 API를 유지하고 1단계 `GET /api/v1/mobile/events`, 2단계 `GET /api/v1/mobile/events/{event_id}/crop`을 추가했다. 모바일 목록/이미지 작업·연동 전 이 절을 읽는다. 상세보기·영상·Live는 제외한다. DB 변경 및 탐지/저장 흐름 변경도 없다.
+
+### 인증과 요청
+
+기존 로그인 API의 Access 토큰을 `Authorization: Bearer <access_token>`으로 전달한다. Refresh 토큰/만료/로그아웃한 세션은 401이다. 모바일 전용 계정이나 권한은 추가하지 않는다.
+
+| 쿼리 | 계약 |
+| --- | --- |
+| date | 필수 YYYY-MM-DD, 한국 시간(UTC+09:00) 기준 날짜 |
+| limit | 기본 30, 1~100 |
+| before_occurred_at | 다음 페이지 커서의 시간대 포함 시각 |
+| before_event_id | 다음 페이지 커서 ID. 시각과 함께 전달 |
+
+한국 날짜의 00:00 이상/다음 날 00:00 미만을 UTC로 변환하여 조회한다. 잘못된 날짜/커서/범위/알 수 없는 쿼리는 422 VALIDATION_ERROR다. 기존 목록과 같은 엄격한 정수 입력 규칙을 사용한다. 정렬은 occurred_at DESC, event_id DESC이고 모든 페이지에 date 조건을 유지한다. 과거 서버 실행 기록도 포함한다.
+
+### 응답
+
+```json
+{
+  "date": "2026-11-21",
+  "items": [
+    {
+      "event_id": 123,
+      "event_type": "person_appeared",
+      "global_person_id": 12,
+      "camera_id": 1,
+      "camera_name": "정문",
+      "occurred_at": "2026-11-21T03:30:00.000000Z",
+      "crop_url": "/api/v1/mobile/events/123/crop",
+      "estimated_gender": "Male",
+      "estimated_age": "청년"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- 성공 200, Cache-Control: no-store. 빈 날짜는 items=[], next_cursor=null이다.
+- 다음 페이지가 있으면 next_cursor는 `{"before_occurred_at":"...Z","before_event_id":123}`이다. 두 값을 같은 date/limit과 함께 전달한다. 마지막 페이지는 null이다.
+- 발생 시각은 UTC 고정 소수 6자리 Z이며 앱에서 한국 시간으로 표시한다. 카메라 이름은 현재 등록 이름이다. 원본 장치 주소/저장소 경로는 반환하지 않는다.
+- 등장 카드는 자기 crop_path/cnn_result를 사용한다. 사라짐은 related_event_id의 등장 정보를 사용하며, 카드의 ID/종류/시각은 사라짐 자체의 값이다. 한 SELECT의 JOIN으로 카메라/등장 정보를 합친다.
+- CNN 결과가 없으면 estimated_gender/estimated_age는 null이다. 분석 대기/실패를 별도로 구분하지 않는다. 저장 후 같은 목록을 다시 GET하면 최신 결과가 나온다. 추정 성별은 Male/Female, 추정 나이는 소년/소녀/청년/장년이다.
+- 카메라 시작/중지의 global_person_id/crop_url/estimated_gender/estimated_age는 null이다.
+- crop_path가 없으면 crop_url=null이다. 경로가 있으면 위 상대 API 주소를 반환하며, 실제 파일 존재는 목록에서 검사하지 않는다. crop_url은 아래 이미지 GET으로 조회하며 파일이 사라졌어도 목록 전체를 실패시키지 않는다.
+- 새로고침은 커서를 초기화하고 해당 날짜 첫 페이지부터 조회한다. 실시간 스냅샷/구독/통계는 제공하지 않는다.
+
+### crop 이미지 — GET /api/v1/mobile/events/{event_id}/crop
+
+- 목록과 같은 관리자 Access Bearer 인증이 필요하다. ID는 1~2^63−1 정수다.
+- 등장은 자기 crop_path, 사라짐은 related_event_id로 연결된 등장 crop_path를 사용한다. 매 요청마다 현재 DB 경로를 읽으므로 폴더 이름 변경 후 경로 PATCH가 반영되면 같은 crop_url로 최신 파일을 받는다.
+- 성공 200 + JPEG 원본 바이트, Content-Type: image/jpeg, Cache-Control: no-store, X-Content-Type-Options: nosniff다. JSON/Base64가 아니며 절대경로를 반환하지 않는다.
+- 이벤트가 없으면 404 EVENT_NOT_FOUND. 카메라 이벤트/이미지 경로 없음/파일·저장소 없음/빈 파일/디렉터리/접근 실패/허용되지 않은 경로는 404 EVENT_CROP_NOT_FOUND다. 인증 실패는 401, 잘못된 ID는 422다. 오류는 기존 ErrorResponse이며 내부 파일 경로를 노출하지 않는다.
+- 기존 StorageService의 crop 경로 검증을 재사용한다. 저장소 루트, 상대 경로 문법, 이벤트/인물/카메라/날짜/파일명, 일반 파일·0바이트 여부, 저장소 경계와 심볼릭 링크·junction/reparse point를 검사한다. clip/trajectory가 없어도 crop만 있으면 조회한다.
+- 검증 후 파일을 바로 읽어 응답한다. 읽기 중 파일 소실/권한 오류도 위 404로 처리한다. JPEG 디코딩/변환은 수행하지 않으며 파일 내용과 생성 완료는 기존 PC 저장 책임이다. 외부 프로세스의 검증 직후 파일/링크 교체까지 원자적으로 보호하지 않는다.
+- 원본 crop을 메모리로 읽는 단순 MVP다. 영상/궤적 이미지/임의 파일 경로/정적 폴더 공개 API는 추가하지 않는다.
+
+### Postman으로 목록·crop 확인
+
+가져오기 가능한 [Postman 컬렉션](../backend/postman/mobile-events.postman_collection.json)과 변수 설정·수동 확인 항목은 [백엔드 README의 모바일 API 3단계](../backend/README.md)를 참고한다. 컬렉션에는 실제 계정·토큰이 없으며 직접 입력한다.
+
+관제 프로그램 실행 후 다음 순서로 요청한다. 현재 자동 실행 주소는 http://127.0.0.1:9000이며 같은 PC에서 테스트한다.
+
+1. POST `/api/v1/auth/login`, Body raw/JSON에 기존 username/password를 입력한다.
+2. 응답 access_token을 GET 요청의 Authorization → Bearer Token에 입력한다.
+3. GET `/api/v1/mobile/events?date=2026-11-21&limit=30`을 요청한다. 실제 기록이 있는 한국 날짜를 선택한다.
+4. 네 이벤트 타입의 카드/사라짐 연결/CNN null을 확인한다. PC에서 분석이 저장된 뒤 같은 GET으로 최신 결과를 확인한다.
+5. next_cursor가 있으면 두 커서를 Params에 추가하고 date도 유지한다. 시각에 +09:00을 직접 넣는 경우 +가 URL 인코딩되도록 Params를 사용한다.
+6. 응답 crop_url이 있으면 `http://127.0.0.1:9000` 뒤에 붙여 새 GET 요청을 만든다. 이 요청에도 Authorization → Bearer Token을 설정한다. 성공 시 Body Preview에서 이미지와 Content-Type: image/jpeg를 확인한다. 브라우저에서 주소만 여는 방식은 인증 헤더가 없어 401이다.
+7. 사라짐 카드 crop_url도 동일 인물 관측의 등장 이미지를 반환하는지 확인한다. 카메라 카드는 crop_url=null이다.
+8. 빈 날짜 200/빈 목록, 잘못된 날짜 422, 인증 누락 401, 존재하지 않는 이벤트 이미지 404 EVENT_NOT_FOUND를 확인한다. 이미지가 없는 실제 이벤트는 404 EVENT_CROP_NOT_FOUND다. 운영 파일을 지워서 오류를 만들 필요는 없다.
+
+자동 검증은 `backend/tests/test_mobile_event_api.py`의 임시 DB/파일 TestClient 및 로컬 임시 Uvicorn HTTP로 수행한다. 운영 DB·카메라·Postman 직접 조작·Flutter·다른 기기 접속 검증과 구분한다. 테스트 실행 디렉터리는 프로젝트 루트다.
+
+```powershell
+.\venv311\Scripts\python.exe -B -m unittest discover -s client_code/backend/tests -v
+```
+
 ## 이벤트 API — PC 이벤트 MVP
 
 ### 구현 상태와 공통 규칙
